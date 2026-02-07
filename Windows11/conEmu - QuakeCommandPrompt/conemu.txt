@@ -1,0 +1,3 @@
+"C:\Program Files\ConEmu\ConEmu64.exe" /StartTSA
+userdir/.conemu/CmdInit.cmd
+shell:startup
