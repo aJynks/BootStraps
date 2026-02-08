@@ -1,0 +1,6 @@
+## clone git using current dir as root
+git clone https://github.com/<usr>/repo.git .
+
+## Update to latest main branch, used for online libraries. When you never do local edits.
+git fetch origin
+git reset --hard origin/main
