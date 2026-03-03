@@ -16,6 +16,6 @@ refreshenv
 cc install python -y
 setx PATH "%PATH%;C:\Users\itisme\AppData\Roaming\Python\Python314\Scripts"
 python -m pip install --upgrade pip
-python -m pip install svgpathtools shapely numpy omg
+python -m pip install svgpathtools shapely numpy omg fonttools
 refreshenv
 

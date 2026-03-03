@@ -1,0 +1,50 @@
+@echo off
+
+call grabtxt.bat "https://api.tabletopsimulator.com/intro/"
+call grabtxt.bat "https://api.tabletopsimulator.com/types/"
+call grabtxt.bat "https://api.tabletopsimulator.com/events/"
+call grabtxt.bat "https://api.tabletopsimulator.com/base/"
+call grabtxt.bat "https://api.tabletopsimulator.com/object/"
+call grabtxt.bat "https://api.tabletopsimulator.com/backgrounds/"
+call grabtxt.bat "https://api.tabletopsimulator.com/color/"
+call grabtxt.bat "https://api.tabletopsimulator.com/grid/"
+call grabtxt.bat "https://api.tabletopsimulator.com/hands/"
+call grabtxt.bat "https://api.tabletopsimulator.com/info/"
+call grabtxt.bat "https://api.tabletopsimulator.com/json/"
+call grabtxt.bat "https://api.tabletopsimulator.com/lighting/"
+call grabtxt.bat "https://api.tabletopsimulator.com/musicplayer/"
+call grabtxt.bat "https://api.tabletopsimulator.com/notes/"
+call grabtxt.bat "https://api.tabletopsimulator.com/physics/"
+call grabtxt.bat "https://api.tabletopsimulator.com/tables/"
+call grabtxt.bat "https://api.tabletopsimulator.com/time/"
+call grabtxt.bat "https://api.tabletopsimulator.com/timer/"
+call grabtxt.bat "https://api.tabletopsimulator.com/turns/"
+call grabtxt.bat "https://api.tabletopsimulator.com/ui/"
+call grabtxt.bat "https://api.tabletopsimulator.com/vector/"
+call grabtxt.bat "https://api.tabletopsimulator.com/wait/"
+
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/assetbundle/" -d "Object Behaviors"
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/book/" -d "Object Behaviors"
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/browser/" -d "Object Behaviors"
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/clock/" -d "Object Behaviors"
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/container/" -d "Object Behaviors"
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/counter/" -d "Object Behaviors"
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/layoutzone/" -d "Object Behaviors"
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/rpgfigurine/" -d "Object Behaviors"
+call grabtxt.bat "https://api.tabletopsimulator.com/behavior/texttool/" -d "Object Behaviors"
+
+call grabtxt.bat "https://api.tabletopsimulator.com/components/introduction/" -d "Object Components"
+call grabtxt.bat "https://api.tabletopsimulator.com/components/gameobject/" -d "Object Components"
+call grabtxt.bat "https://api.tabletopsimulator.com/components/component/" -d "Object Components"
+call grabtxt.bat "https://api.tabletopsimulator.com/components/material/" -d "Object Components"
+call grabtxt.bat "https://api.tabletopsimulator.com/components/examples/" -d "Object Components"
+
+call grabtxt.bat "https://api.tabletopsimulator.com/webrequest/instance/" -d "Web Requests"
+call grabtxt.bat "https://api.tabletopsimulator.com/webrequest/manager/" -d "Web Requests"
+
+call grabtxt.bat "https://api.tabletopsimulator.com/player/colors/" -d "Players"
+call grabtxt.bat "https://api.tabletopsimulator.com/player/instance/" -d "Players"
+call grabtxt.bat "https://api.tabletopsimulator.com/player/manager/" -d "Players"
+
+echo Done.
+pause
