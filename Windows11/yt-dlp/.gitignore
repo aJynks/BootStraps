@@ -1,0 +1,2 @@
+# Ignore executables in the repo root only
+/*.exe

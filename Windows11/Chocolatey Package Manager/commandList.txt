@@ -9,6 +9,7 @@ refreshenv (refreshes paths in command line, once choco is installed)
 cc install conemu -y
 cc install imagemagick -y
 cc install busybox -y
+cc install qalculate -y
 gsudo busybox64 --install -s C:\Tools\busybox64
 setx PATH "%PATH%;C:\Tools\busybox64"
 refreshenv
