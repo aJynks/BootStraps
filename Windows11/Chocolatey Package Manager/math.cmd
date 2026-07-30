@@ -1,4 +1,5 @@
+@echo off
 REM run qalculate CLI
 REM choco install qalculate -Y
 REM c:\ProgramData\chocolatey\bin\
-@"C:\Program Files\Qalculate\qalc.exe" %*
+"C:\Program Files\Qalculate\qalc.exe" %*

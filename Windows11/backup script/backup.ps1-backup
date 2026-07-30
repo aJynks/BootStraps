@@ -10,7 +10,7 @@ function HelpShort {
 @"
 Commands
 
-backup -path "PATH" [--excludeDir "dir1" "dir2" ...] [--excludeFile "*.log" "file.txt" ...]
+backup -path "PATH" [--exclude "dir1" "dir2" ...]
 
 backup -push | -store
 backup -pull | -fetch
@@ -29,42 +29,31 @@ Backup tool using robocopy.
 
 CONFIG
 ------
-.backuppath.conf contains the server directory path and optional
-exclude lists for directories and files.
+.backuppath.conf contains the server directory path and optional exclude list.
 
 COMMANDS
 --------
 
--path "PATH" [--excludeDir "dir1" "dir2" ...] [--excludeFile "*.log" ...]
+-path "PATH" [--exclude "dir1" "dir2" ...]
     Save the server path to config.
-    Optionally list directory names and/or file names to exclude.
+    Optionally list directory names to exclude from push.
     Overwrites the entire config each time.
-    Quote any name containing spaces.
-
-    Excluded directories are matched by name at any depth.
-    Excluded files are matched by name or wildcard (* ?) at any
-    depth. No paths - if the same name exists in many directories,
-    it is excluded in all of them.
-
-    Names do not need to exist yet; nothing is validated.
+    Quote any directory name containing spaces.
 
     Examples:
         backup -path "D:\Backup"
-        backup -path "D:\Backup" --excludeDir node_modules .git
-        backup -path "D:\Backup" --excludeDir "my folder" --excludeFile *.log thumbs.db
+        backup -path "D:\Backup" --exclude node_modules .git
+        backup -path "D:\Backup" --exclude node_modules "my folder"
 
 -push / -store
     Mirror local directory -> server directory.
-    Excluded directories and files are never copied.
+    Excludes any directories listed in config.
 
 -pull / -fetch
     Mirror server directory -> local directory.
-    Excluded directories and files are never copied, and local
-    copies of excluded content are never deleted.
 
 -verify
     Compare directories without modifying anything.
-    Excluded content is ignored by the comparison.
 
 --dry
     Simulate changes without modifying files.
@@ -150,7 +139,7 @@ function GetRawArgTokens {
     return $tokens
 }
 
-function SaveConf($serverPath, $excludeDirs, $excludeFiles) {
+function SaveConf($serverPath, $excludes) {
     $clean = NormalizePath $serverPath
 
     if ([string]::IsNullOrWhiteSpace($clean)) {
@@ -159,28 +148,17 @@ function SaveConf($serverPath, $excludeDirs, $excludeFiles) {
     }
 
     # Store excludes alphabetically regardless of input order
-    if ($excludeDirs.Count -gt 0) {
-        $excludeDirs = @($excludeDirs | Sort-Object)
-    }
-    if ($excludeFiles.Count -gt 0) {
-        $excludeFiles = @($excludeFiles | Sort-Object)
+    if ($excludes.Count -gt 0) {
+        $excludes = @($excludes | Sort-Object)
     }
 
-    # Blank line before each header for readability
+    # Blank line before the exclude header for readability
     $lines = @("path=$clean")
 
-    if ($excludeDirs.Count -gt 0) {
+    if ($excludes.Count -gt 0) {
         $lines += ""
-        $lines += "--== Excluded Directories ==--"
-        foreach ($e in $excludeDirs) {
-            $lines += $e
-        }
-    }
-
-    if ($excludeFiles.Count -gt 0) {
-        $lines += ""
-        $lines += "--== Excluded Files ==--"
-        foreach ($e in $excludeFiles) {
+        $lines += "--== exclude ==--"
+        foreach ($e in $excludes) {
             $lines += $e
         }
     }
@@ -188,16 +166,9 @@ function SaveConf($serverPath, $excludeDirs, $excludeFiles) {
     Set-Content -Path $conf -Value $lines -Encoding UTF8
     Write-Host "Saved server path to .backuppath.conf"
 
-    if ($excludeDirs.Count -gt 0) {
-        Write-Host "Excluded directories:"
-        foreach ($e in $excludeDirs) {
-            Write-Host "  $e"
-        }
-    }
-
-    if ($excludeFiles.Count -gt 0) {
-        Write-Host "Excluded files:"
-        foreach ($e in $excludeFiles) {
+    if ($excludes.Count -gt 0) {
+        Write-Host "Excludes:"
+        foreach ($e in $excludes) {
             Write-Host "  $e"
         }
     }
@@ -213,9 +184,8 @@ function ReadConf {
     $lines = @(Get-Content -Path $conf -Encoding UTF8)
 
     $serverPath = ""
-    $excludeDirs = @()
-    $excludeFiles = @()
-    $section = "none"
+    $excludes = @()
+    $inExclude = $false
 
     foreach ($line in $lines) {
         $trimmed = ([string]$line).Trim()
@@ -223,31 +193,12 @@ function ReadConf {
         if ($trimmed -match '^path=(.*)$') {
             $serverPath = NormalizePath $matches[1]
         }
-        elseif ($trimmed -match '^--==\s*(.*?)\s*==--$') {
-            # Any header line switches section. Unknown headers stop
-            # collection so their contents never leak into a list.
-            $header = $matches[1]
-
-            if ($header -ieq "Excluded Directories") {
-                $section = "dirs"
-            }
-            elseif ($header -ieq "Excluded Files") {
-                $section = "files"
-            }
-            elseif ($header -ieq "exclude") {
-                # Legacy header from older confs
-                $section = "dirs"
-            }
-            else {
-                $section = "none"
-            }
+        elseif ($trimmed -eq "--== exclude ==--") {
+            $inExclude = $true
         }
-        elseif ($trimmed -ne "") {
-            if ($section -eq "dirs") {
-                $excludeDirs += $trimmed
-            }
-            elseif ($section -eq "files") {
-                $excludeFiles += $trimmed
+        elseif ($inExclude) {
+            if ($trimmed -ne "") {
+                $excludes += $trimmed
             }
         }
     }
@@ -266,14 +217,11 @@ function ReadConf {
     }
 
     # Keep display order alphabetical even if the conf was hand-edited
-    if ($excludeDirs.Count -gt 0) {
-        $excludeDirs = @($excludeDirs | Sort-Object)
-    }
-    if ($excludeFiles.Count -gt 0) {
-        $excludeFiles = @($excludeFiles | Sort-Object)
+    if ($excludes.Count -gt 0) {
+        $excludes = @($excludes | Sort-Object)
     }
 
-    return @{ Path = $serverPath; ExcludeDirs = $excludeDirs; ExcludeFiles = $excludeFiles }
+    return @{ Path = $serverPath; Excludes = $excludes }
 }
 
 function IsDriveRoot($p) {
@@ -318,23 +266,7 @@ function SafetyCheck($src, $dst, [bool]$createTargetIfMissing = $false) {
     }
 }
 
-function ShowExcludes($excludeDirs, $excludeFiles) {
-    if ($excludeDirs.Count -gt 0) {
-        Write-Host "Excluding directories:"
-        foreach ($e in $excludeDirs) {
-            Write-Host "  $e"
-        }
-    }
-
-    if ($excludeFiles.Count -gt 0) {
-        Write-Host "Excluding files:"
-        foreach ($e in $excludeFiles) {
-            Write-Host "  $e"
-        }
-    }
-}
-
-function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles) {
+function RunRobocopy($src, $dst, $verifyOnly, $excludes) {
     $src = NormalizePath $src
     $dst = NormalizePath $dst
 
@@ -354,19 +286,9 @@ function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles) {
         $rcArgs += "/L"
     }
 
-    # /XD and /XF match names at any depth. They also suppress /MIR's
-    # purge for excluded content, so excluded files and directories
-    # are never copied and never deleted on either side.
-    if ($excludeDirs.Count -gt 0) {
+    if ($excludes.Count -gt 0) {
         $rcArgs += "/XD"
-        foreach ($e in $excludeDirs) {
-            $rcArgs += $e
-        }
-    }
-
-    if ($excludeFiles.Count -gt 0) {
-        $rcArgs += "/XF"
-        foreach ($e in $excludeFiles) {
+        foreach ($e in $excludes) {
             $rcArgs += $e
         }
     }
@@ -413,44 +335,60 @@ switch ($args[0]) {
         }
 
         $targetPath = $tokens[1]
-        $excludeDirs = @()
-        $excludeFiles = @()
-        $collecting = "none"
+        $excludes = @()
+        $collecting = $false
 
         for ($i = 2; $i -lt $tokens.Count; $i++) {
             $t = $tokens[$i]
 
-            if ($t -ieq "--excludeDir" -or $t -ieq "--exclude") {
-                # --exclude retained as a legacy alias
-                $collecting = "dirs"
-            }
-            elseif ($t -ieq "--excludeFile") {
-                $collecting = "files"
+            if ($t -eq "--exclude") {
+                $collecting = $true
             }
             elseif ($t -eq "--dry") {
                 continue
             }
-            elseif ($collecting -ne "none") {
+            elseif ($collecting) {
                 # "./cat" and "cat" are the same thing; strip the
                 # leading ./ or .\ but never eat dot-names like .git
                 $entry = $t.Trim()
                 $entry = $entry -replace '^\.[\\/]', ''
                 $entry = $entry.TrimEnd('\', '/')
                 if ($entry -ne "") {
-                    if ($collecting -eq "dirs") {
-                        $excludeDirs += $entry
-                    }
-                    else {
-                        $excludeFiles += $entry
-                    }
+                    $excludes += $entry
                 }
             }
         }
 
-        # Nothing is validated: names may refer to directories or
-        # files that do not exist yet, or never will.
+        # Every exclude dir must actually exist, otherwise error out
+        # and leave the conf untouched. Bare names are checked at the
+        # top level first, then anywhere in the tree (robocopy /XD
+        # matches at any depth).
+        if ($excludes.Count -gt 0) {
+            $missing = @()
 
-        SaveConf $targetPath $excludeDirs $excludeFiles
+            foreach ($e in $excludes) {
+                $atRoot = Join-Path $local $e
+                if (Test-Path -LiteralPath $atRoot -PathType Container) {
+                    continue
+                }
+
+                $found = Get-ChildItem -Path $local -Directory -Recurse -Filter $e -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($null -eq $found) {
+                    $missing += $e
+                }
+            }
+
+            if ($missing.Count -gt 0) {
+                Write-Host "ERROR: Exclude directory not found:"
+                foreach ($m in $missing) {
+                    Write-Host "  $m"
+                }
+                Write-Host "Config not written."
+                exit 1
+            }
+        }
+
+        SaveConf $targetPath $excludes
         exit
     }
 
@@ -470,8 +408,7 @@ switch ($args[0]) {
 
 $confData = ReadConf
 $server = $confData.Path
-$excludeDirs = $confData.ExcludeDirs
-$excludeFiles = $confData.ExcludeFiles
+$excludes = $confData.Excludes
 
 if ($mode -eq "push") {
     SafetyCheck $local $server $true
@@ -480,11 +417,16 @@ if ($mode -eq "push") {
     Write-Host "LOCAL  -> SERVER"
     Write-Host "$local -> $server"
 
-    ShowExcludes $excludeDirs $excludeFiles
+    if ($excludes.Count -gt 0) {
+        Write-Host "Excluding:"
+        foreach ($e in $excludes) {
+            Write-Host "  $e"
+        }
+    }
 
     Write-Host ""
 
-    RunRobocopy $local $server $false $excludeDirs $excludeFiles
+    RunRobocopy $local $server $false $excludes
 }
 
 if ($mode -eq "pull") {
@@ -493,12 +435,9 @@ if ($mode -eq "pull") {
     Write-Host ""
     Write-Host "SERVER -> LOCAL"
     Write-Host "$server -> $local"
-
-    ShowExcludes $excludeDirs $excludeFiles
-
     Write-Host ""
 
-    RunRobocopy $server $local $false $excludeDirs $excludeFiles
+    RunRobocopy $server $local $false @()
 }
 
 if ($mode -eq "verify") {
@@ -506,10 +445,7 @@ if ($mode -eq "verify") {
 
     Write-Host ""
     Write-Host "VERIFYING"
-
-    ShowExcludes $excludeDirs $excludeFiles
-
     Write-Host ""
 
-    RunRobocopy $local $server $true $excludeDirs $excludeFiles
+    RunRobocopy $local $server $true @()
 }
