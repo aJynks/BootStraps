@@ -44,6 +44,9 @@ exit /b %ERRORLEVEL%
 echo Usage:
 echo   linkset "newLinkDir" "targetDir"
 echo.
+echo   newLinkDir : This is created at the current location as a "link directory"
+echo   targetDir  : This is the directory the "link directory" points to
+echo.
 echo Options:
 echo   -h, --help, -help, /?
 exit /b 0

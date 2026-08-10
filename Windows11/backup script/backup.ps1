@@ -334,7 +334,23 @@ function ShowExcludes($excludeDirs, $excludeFiles) {
     }
 }
 
-function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles) {
+function GetLocalSymlinks($root) {
+    # Returns full paths of all SYMLINKD entries under $root.
+    # These are directory symbolic links created with mklink /D.
+    $links = @()
+    try {
+        $items = Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.LinkType -eq "SymbolicLink" -and $_.PSIsContainer }
+        foreach ($item in $items) {
+            $links += $item.FullName
+        }
+    } catch {
+        # Non-fatal: if the scan fails, return empty and let robocopy behave normally
+    }
+    return $links
+}
+
+function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles, $localSymlinks = @()) {
     $src = NormalizePath $src
     $dst = NormalizePath $dst
 
@@ -357,9 +373,15 @@ function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles) {
     # /XD and /XF match names at any depth. They also suppress /MIR's
     # purge for excluded content, so excluded files and directories
     # are never copied and never deleted on either side.
-    if ($excludeDirs.Count -gt 0) {
+    #
+    # Local symlinks are passed as full paths to /XD so they are
+    # protected from purge on pull without risking false matches on
+    # same-named real directories elsewhere in the tree.
+    $allExcludeDirs = @($excludeDirs) + @($localSymlinks)
+
+    if ($allExcludeDirs.Count -gt 0) {
         $rcArgs += "/XD"
-        foreach ($e in $excludeDirs) {
+        foreach ($e in $allExcludeDirs) {
             $rcArgs += $e
         }
     }
@@ -484,11 +506,13 @@ if ($mode -eq "push") {
 
     Write-Host ""
 
-    RunRobocopy $local $server $false $excludeDirs $excludeFiles
+    RunRobocopy $local $server $false $excludeDirs $excludeFiles @()
 }
 
 if ($mode -eq "pull") {
     SafetyCheck $server $local $false
+
+    $localSymlinks = GetLocalSymlinks $local
 
     Write-Host ""
     Write-Host "SERVER -> LOCAL"
@@ -496,9 +520,16 @@ if ($mode -eq "pull") {
 
     ShowExcludes $excludeDirs $excludeFiles
 
+    if ($localSymlinks.Count -gt 0) {
+        Write-Host "Preserving local symlinks:"
+        foreach ($s in $localSymlinks) {
+            Write-Host "  $s"
+        }
+    }
+
     Write-Host ""
 
-    RunRobocopy $server $local $false $excludeDirs $excludeFiles
+    RunRobocopy $server $local $false $excludeDirs $excludeFiles $localSymlinks
 }
 
 if ($mode -eq "verify") {
@@ -511,5 +542,5 @@ if ($mode -eq "verify") {
 
     Write-Host ""
 
-    RunRobocopy $local $server $true $excludeDirs $excludeFiles
+    RunRobocopy $local $server $true $excludeDirs $excludeFiles @()
 }
