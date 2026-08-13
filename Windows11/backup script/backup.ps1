@@ -1,6 +1,7 @@
 $conf = ".backuppath.conf"
 $local = (Get-Location).Path
 $dry = $false
+$forceScan = $false
 
 if ($args -contains "--dry") {
     $dry = $true
@@ -10,11 +11,14 @@ function HelpShort {
 @"
 Commands
 
-backup -path "PATH" [--excludeDir "dir1" "dir2" ...] [--excludeFile "*.log" "file.txt" ...]
+backup -path "PATH" [--excludeDir "dir1" "dir2" ...] [--excludeFile "*.log" "file.txt" ...] [-scanLinks]
+backup -pathlinks "PATH" [--excludeDir ...] [--excludeFile ...]
 
 backup -push | -store
 backup -pull | -fetch
 backup -verify
+
+backup --scanLinks
 
 backup --dry
 
@@ -29,13 +33,14 @@ Backup tool using robocopy.
 
 CONFIG
 ------
-.backuppath.conf contains the server directory path and optional
-exclude lists for directories and files.
+.backuppath.conf contains the server directory path, optional
+exclude lists for directories and files, and the symbolic links
+recorded by --scanLinks.
 
 COMMANDS
 --------
 
--path "PATH" [--excludeDir "dir1" "dir2" ...] [--excludeFile "*.log" ...]
+-path "PATH" [--excludeDir "dir1" "dir2" ...] [--excludeFile "*.log" ...] [-scanLinks]
     Save the server path to config.
     Optionally list directory names and/or file names to exclude.
     Overwrites the entire config each time.
@@ -48,10 +53,17 @@ COMMANDS
 
     Names do not need to exist yet; nothing is validated.
 
+    Add -scanLinks to scan for symbolic links straight after the
+    config is written.
+
     Examples:
         backup -path "D:\Backup"
         backup -path "D:\Backup" --excludeDir node_modules .git
         backup -path "D:\Backup" --excludeDir "my folder" --excludeFile *.log thumbs.db
+        backup -path "D:\Backup" --excludeDir node_modules -scanLinks
+
+-pathlinks "PATH" [--excludeDir ...] [--excludeFile ...]
+    Same as -path with -scanLinks always applied.
 
 -push / -store
     Mirror local directory -> server directory.
@@ -66,8 +78,35 @@ COMMANDS
     Compare directories without modifying anything.
     Excluded content is ignored by the comparison.
 
+--scanLinks
+    Scan the local directory for directory symbolic links
+    (created with mklink /D) and record their full paths under
+    "--== System Link Directories ==--".
+
+    Replaces the whole section each time, so links that no longer
+    exist are dropped.
+
+    Needs a config that already has a path. Use -path -scanLinks
+    or -pathlinks to do both at once.
+
 --dry
     Simulate changes without modifying files.
+
+SYMBOLIC LINKS
+--------------
+
+Recorded links are excluded exactly like any other excluded
+directory. Robocopy never looks inside them on either side, so
+they are never copied to the server and never deleted locally.
+
+Without this, -pull would find no matching directory on the
+server and purge the link - following it and deleting the real
+contents it points at. Robocopy's /XJ flag does not prevent
+this; it only excludes links on the source side.
+
+The list is only refreshed by --scanLinks, and -path clears it
+along with the rest of the config. After adding or removing a
+link, or after running -path, run --scanLinks again.
 
 SAFETY
 ------
@@ -150,7 +189,7 @@ function GetRawArgTokens {
     return $tokens
 }
 
-function SaveConf($serverPath, $excludeDirs, $excludeFiles) {
+function SaveConf($serverPath, $excludeDirs, $excludeFiles, $linkDirs = @(), [bool]$quiet = $false) {
     $clean = NormalizePath $serverPath
 
     if ([string]::IsNullOrWhiteSpace($clean)) {
@@ -164,6 +203,9 @@ function SaveConf($serverPath, $excludeDirs, $excludeFiles) {
     }
     if ($excludeFiles.Count -gt 0) {
         $excludeFiles = @($excludeFiles | Sort-Object)
+    }
+    if ($linkDirs.Count -gt 0) {
+        $linkDirs = @($linkDirs | Sort-Object)
     }
 
     # Blank line before each header for readability
@@ -185,7 +227,22 @@ function SaveConf($serverPath, $excludeDirs, $excludeFiles) {
         }
     }
 
+    # Written last: full paths, kept apart from the hand-edited
+    # exclude lists because only --scanLinks maintains them.
+    if ($linkDirs.Count -gt 0) {
+        $lines += ""
+        $lines += "--== System Link Directories ==--"
+        foreach ($e in $linkDirs) {
+            $lines += $e
+        }
+    }
+
     Set-Content -Path $conf -Value $lines -Encoding UTF8
+
+    if ($quiet) {
+        return
+    }
+
     Write-Host "Saved server path to .backuppath.conf"
 
     if ($excludeDirs.Count -gt 0) {
@@ -215,6 +272,7 @@ function ReadConf {
     $serverPath = ""
     $excludeDirs = @()
     $excludeFiles = @()
+    $linkDirs = @()
     $section = "none"
 
     foreach ($line in $lines) {
@@ -234,6 +292,9 @@ function ReadConf {
             elseif ($header -ieq "Excluded Files") {
                 $section = "files"
             }
+            elseif ($header -ieq "System Link Directories") {
+                $section = "links"
+            }
             elseif ($header -ieq "exclude") {
                 # Legacy header from older confs
                 $section = "dirs"
@@ -248,6 +309,9 @@ function ReadConf {
             }
             elseif ($section -eq "files") {
                 $excludeFiles += $trimmed
+            }
+            elseif ($section -eq "links") {
+                $linkDirs += NormalizePath $trimmed
             }
         }
     }
@@ -272,8 +336,22 @@ function ReadConf {
     if ($excludeFiles.Count -gt 0) {
         $excludeFiles = @($excludeFiles | Sort-Object)
     }
+    if ($linkDirs.Count -gt 0) {
+        $linkDirs = @($linkDirs | Sort-Object)
+    }
 
-    return @{ Path = $serverPath; ExcludeDirs = $excludeDirs; ExcludeFiles = $excludeFiles }
+    # Symlinks are ordinary /XD exclusions - merging them here means
+    # push, pull and verify need no special handling at all.
+    # ExcludeDirs is what robocopy gets; LinkDirs is kept separate
+    # only so --scanLinks can replace it and the two can be listed
+    # apart on screen.
+    return @{
+        Path         = $serverPath
+        ExcludeDirs  = @($excludeDirs) + @($linkDirs)
+        ExcludeFiles = $excludeFiles
+        ConfDirs     = $excludeDirs
+        LinkDirs     = $linkDirs
+    }
 }
 
 function IsDriveRoot($p) {
@@ -318,7 +396,7 @@ function SafetyCheck($src, $dst, [bool]$createTargetIfMissing = $false) {
     }
 }
 
-function ShowExcludes($excludeDirs, $excludeFiles) {
+function ShowExcludes($excludeDirs, $excludeFiles, $linkDirs = @()) {
     if ($excludeDirs.Count -gt 0) {
         Write-Host "Excluding directories:"
         foreach ($e in $excludeDirs) {
@@ -332,25 +410,57 @@ function ShowExcludes($excludeDirs, $excludeFiles) {
             Write-Host "  $e"
         }
     }
-}
 
-function GetLocalSymlinks($root) {
-    # Returns full paths of all SYMLINKD entries under $root.
-    # These are directory symbolic links created with mklink /D.
-    $links = @()
-    try {
-        $items = Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.LinkType -eq "SymbolicLink" -and $_.PSIsContainer }
-        foreach ($item in $items) {
-            $links += $item.FullName
+    if ($linkDirs.Count -gt 0) {
+        Write-Host "Excluding system links:"
+        foreach ($e in $linkDirs) {
+            Write-Host "  $e"
         }
-    } catch {
-        # Non-fatal: if the scan fails, return empty and let robocopy behave normally
     }
-    return $links
 }
 
-function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles, $localSymlinks = @()) {
+function ScanLocalSymlinks($root) {
+    # Walks the local tree for directory symbolic links (mklink /D).
+    # Only --scanLinks runs this; push and pull read the config, so a
+    # large tree is never scanned during a normal backup.
+    $found = @()
+
+    $items = Get-ChildItem -LiteralPath $root -Directory -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.LinkType -eq "SymbolicLink" }
+
+    foreach ($item in $items) {
+        $found += NormalizePath $item.FullName
+    }
+
+    return $found
+}
+
+function DoScanLinks($serverPath, $excludeDirs, $excludeFiles) {
+    Write-Host ""
+    Write-Host "SCANNING FOR SYSTEM LINKS"
+    Write-Host $local
+    Write-Host ""
+
+    $found = @(ScanLocalSymlinks $local)
+
+    # Replaces the section outright - links that are gone drop out.
+    SaveConf $serverPath $excludeDirs $excludeFiles $found $true
+
+    if ($found.Count -eq 0) {
+        Write-Host "No system links found."
+        Write-Host "System link section cleared in .backuppath.conf"
+    }
+    else {
+        Write-Host "Found $($found.Count) system link(s):"
+        foreach ($s in $found) {
+            Write-Host "  $s"
+        }
+        Write-Host ""
+        Write-Host "Saved to .backuppath.conf"
+    }
+}
+
+function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles) {
     $src = NormalizePath $src
     $dst = NormalizePath $dst
 
@@ -373,15 +483,9 @@ function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles, $loca
     # /XD and /XF match names at any depth. They also suppress /MIR's
     # purge for excluded content, so excluded files and directories
     # are never copied and never deleted on either side.
-    #
-    # Local symlinks are passed as full paths to /XD so they are
-    # protected from purge on pull without risking false matches on
-    # same-named real directories elsewhere in the tree.
-    $allExcludeDirs = @($excludeDirs) + @($localSymlinks)
-
-    if ($allExcludeDirs.Count -gt 0) {
+    if ($excludeDirs.Count -gt 0) {
         $rcArgs += "/XD"
-        foreach ($e in $allExcludeDirs) {
+        foreach ($e in $excludeDirs) {
             $rcArgs += $e
         }
     }
@@ -419,62 +523,87 @@ switch ($args[0]) {
     "--helpv" { HelpVerbose; exit }
     "helpv"   { HelpVerbose; exit }
 
-    "-path" {
-        # Use raw command-line tokens so trailing backslashes inside
-        # quotes ("z:\test\") cannot corrupt argument splitting.
-        $tokens = GetRawArgTokens
-        if ($null -eq $tokens -or $tokens.Count -lt 2) {
-            # Fallback to PowerShell's own parsing
-            $tokens = @()
-            foreach ($a in $args) { $tokens += [string]$a }
+    "-path"      { $mode = "path" }
+    "-pathlinks" { $mode = "path"; $forceScan = $true }
+}
+
+if ($mode -eq "path") {
+    # Use raw command-line tokens so trailing backslashes inside
+    # quotes ("z:\test\") cannot corrupt argument splitting.
+    $tokens = GetRawArgTokens
+    if ($null -eq $tokens -or $tokens.Count -lt 2) {
+        # Fallback to PowerShell's own parsing
+        $tokens = @()
+        foreach ($a in $args) { $tokens += [string]$a }
+    }
+
+    if ($tokens.Count -lt 2) {
+        Write-Host "ERROR: Missing path"
+        exit 1
+    }
+
+    $targetPath = $tokens[1]
+    $excludeDirs = @()
+    $excludeFiles = @()
+    $collecting = "none"
+    $scanAfter = $forceScan
+
+    for ($i = 2; $i -lt $tokens.Count; $i++) {
+        $t = $tokens[$i]
+
+        if ($t -ieq "--excludeDir" -or $t -ieq "--exclude") {
+            # --exclude retained as a legacy alias
+            $collecting = "dirs"
         }
-
-        if ($tokens.Count -lt 2) {
-            Write-Host "ERROR: Missing path"
-            exit 1
+        elseif ($t -ieq "--excludeFile") {
+            $collecting = "files"
         }
-
-        $targetPath = $tokens[1]
-        $excludeDirs = @()
-        $excludeFiles = @()
-        $collecting = "none"
-
-        for ($i = 2; $i -lt $tokens.Count; $i++) {
-            $t = $tokens[$i]
-
-            if ($t -ieq "--excludeDir" -or $t -ieq "--exclude") {
-                # --exclude retained as a legacy alias
-                $collecting = "dirs"
-            }
-            elseif ($t -ieq "--excludeFile") {
-                $collecting = "files"
-            }
-            elseif ($t -eq "--dry") {
-                continue
-            }
-            elseif ($collecting -ne "none") {
-                # "./cat" and "cat" are the same thing; strip the
-                # leading ./ or .\ but never eat dot-names like .git
-                $entry = $t.Trim()
-                $entry = $entry -replace '^\.[\\/]', ''
-                $entry = $entry.TrimEnd('\', '/')
-                if ($entry -ne "") {
-                    if ($collecting -eq "dirs") {
-                        $excludeDirs += $entry
-                    }
-                    else {
-                        $excludeFiles += $entry
-                    }
+        elseif ($t -ieq "-scanLinks" -or $t -ieq "--scanLinks") {
+            # A flag, never an exclude name - otherwise it would be
+            # swallowed into whichever list is currently collecting.
+            $scanAfter = $true
+        }
+        elseif ($t -eq "--dry") {
+            continue
+        }
+        elseif ($collecting -ne "none") {
+            # "./cat" and "cat" are the same thing; strip the
+            # leading ./ or .\ but never eat dot-names like .git
+            $entry = $t.Trim()
+            $entry = $entry -replace '^\.[\\/]', ''
+            $entry = $entry.TrimEnd('\', '/')
+            if ($entry -ne "") {
+                if ($collecting -eq "dirs") {
+                    $excludeDirs += $entry
+                }
+                else {
+                    $excludeFiles += $entry
                 }
             }
         }
-
-        # Nothing is validated: names may refer to directories or
-        # files that do not exist yet, or never will.
-
-        SaveConf $targetPath $excludeDirs $excludeFiles
-        exit
     }
+
+    # Nothing is validated: names may refer to directories or
+    # files that do not exist yet, or never will.
+
+    # Always a full rewrite - any previously recorded links are
+    # dropped, then re-scanned below if asked for.
+    SaveConf $targetPath $excludeDirs $excludeFiles @()
+
+    if ($scanAfter) {
+        # The conf now exists with a valid path, so the scan can
+        # simply read it back and replace the link section.
+        $c = ReadConf
+        DoScanLinks $c.Path $c.ConfDirs $c.ExcludeFiles
+    }
+
+    exit
+}
+
+switch ($args[0]) {
+    "--scanLinks" { $mode = "scanlinks" }
+    "-scanLinks"  { $mode = "scanlinks" }
+    "scanLinks"   { $mode = "scanlinks" }
 
     "-push"   { $mode = "push" }
     "-store"  { $mode = "push" }
@@ -495,6 +624,11 @@ $server = $confData.Path
 $excludeDirs = $confData.ExcludeDirs
 $excludeFiles = $confData.ExcludeFiles
 
+if ($mode -eq "scanlinks") {
+    DoScanLinks $server $confData.ConfDirs $excludeFiles
+    exit 0
+}
+
 if ($mode -eq "push") {
     SafetyCheck $local $server $true
 
@@ -502,34 +636,25 @@ if ($mode -eq "push") {
     Write-Host "LOCAL  -> SERVER"
     Write-Host "$local -> $server"
 
-    ShowExcludes $excludeDirs $excludeFiles
+    ShowExcludes $confData.ConfDirs $excludeFiles $confData.LinkDirs
 
     Write-Host ""
 
-    RunRobocopy $local $server $false $excludeDirs $excludeFiles @()
+    RunRobocopy $local $server $false $excludeDirs $excludeFiles
 }
 
 if ($mode -eq "pull") {
     SafetyCheck $server $local $false
 
-    $localSymlinks = GetLocalSymlinks $local
-
     Write-Host ""
     Write-Host "SERVER -> LOCAL"
     Write-Host "$server -> $local"
 
-    ShowExcludes $excludeDirs $excludeFiles
-
-    if ($localSymlinks.Count -gt 0) {
-        Write-Host "Preserving local symlinks:"
-        foreach ($s in $localSymlinks) {
-            Write-Host "  $s"
-        }
-    }
+    ShowExcludes $confData.ConfDirs $excludeFiles $confData.LinkDirs
 
     Write-Host ""
 
-    RunRobocopy $server $local $false $excludeDirs $excludeFiles $localSymlinks
+    RunRobocopy $server $local $false $excludeDirs $excludeFiles
 }
 
 if ($mode -eq "verify") {
@@ -538,9 +663,9 @@ if ($mode -eq "verify") {
     Write-Host ""
     Write-Host "VERIFYING"
 
-    ShowExcludes $excludeDirs $excludeFiles
+    ShowExcludes $confData.ConfDirs $excludeFiles $confData.LinkDirs
 
     Write-Host ""
 
-    RunRobocopy $local $server $true $excludeDirs $excludeFiles @()
+    RunRobocopy $local $server $true $excludeDirs $excludeFiles
 }
