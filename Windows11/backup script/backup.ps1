@@ -16,9 +16,12 @@ backup -pathlinks "PATH" [--excludeDir ...] [--excludeFile ...]
 
 backup -push | -store
 backup -pull | -fetch
-backup -verify
 
 backup --scanLinks
+backup --compare
+
+Every command accepts one or two leading dashes
+(--push and -push are the same).
 
 backup --dry
 
@@ -74,10 +77,6 @@ COMMANDS
     Excluded directories and files are never copied, and local
     copies of excluded content are never deleted.
 
--verify
-    Compare directories without modifying anything.
-    Excluded content is ignored by the comparison.
-
 --scanLinks
     Scan the local directory for directory symbolic links
     (created with mklink /D) and record their full paths under
@@ -88,6 +87,31 @@ COMMANDS
 
     Needs a config that already has a path. Use -path -scanLinks
     or -pathlinks to do both at once.
+
+--compare
+    Run robocopy as a dry run and show its full output, then print
+    a formatted report underneath. Nothing is ever modified.
+
+    Excluded content is ignored by the comparison.
+
+    The report lists each differing file with a status tag:
+        [SERVER ONLY]   exists on server, not local
+        [LOCAL  ONLY]   exists locally, not on server
+        [SERVER NEWER]  server copy has a more recent timestamp
+        [LOCAL  NEWER]  local copy has a more recent timestamp
+        [DIFFERENT]     size or attributes differ, timestamps equal
+
+    A count summary follows, then a single verdict line saying
+    whether anything differs and which side is newer:
+
+        IN SYNC - no differences found
+        DIFFERENCES FOUND - local is newer
+        DIFFERENCES FOUND - server is newer
+        DIFFERENCES FOUND - both sides have changes
+
+    Robocopy's own totals are used as a cross-check. If robocopy
+    reports differences but none could be parsed out of its
+    output, the report says so rather than claiming "in sync".
 
 --dry
     Simulate changes without modifying files.
@@ -341,7 +365,7 @@ function ReadConf {
     }
 
     # Symlinks are ordinary /XD exclusions - merging them here means
-    # push, pull and verify need no special handling at all.
+    # push, pull and compare need no special handling at all.
     # ExcludeDirs is what robocopy gets; LinkDirs is kept separate
     # only so --scanLinks can replace it and the two can be listed
     # apart on screen.
@@ -460,7 +484,236 @@ function DoScanLinks($serverPath, $excludeDirs, $excludeFiles) {
     }
 }
 
-function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles) {
+function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
+    # Robocopy runs in list-only mode (/L), so nothing is ever modified.
+    #
+    # Its output is printed as it arrives and captured at the same time.
+    # There is no log file and therefore no encoding to get wrong. An
+    # earlier version wrote /LOG: (which robocopy emits as ANSI) and read
+    # it back as Unicode; every line decoded to garbage, matched nothing,
+    # and the parser reported "In sync" while real differences existed.
+    #
+    # Flag keywords, running local -> server:
+    #   Newer      local copy is newer
+    #   Older      server copy is newer
+    #   *EXTRA     exists on server only
+    #   New File   exists on local only
+    #   Changed / size / attrib   timestamps match, content does not
+
+    $local  = NormalizePath $local
+    $server = NormalizePath $server
+
+    Write-Host ""
+    Write-Host "COMPARING LOCAL <-> SERVER   (dry run - nothing is modified)"
+    Write-Host "$local"
+    Write-Host "$server"
+
+    ShowExcludes $excludeDirs $excludeFiles
+    Write-Host ""
+
+    $rcArgs = @(
+        $local
+        $server
+        "/MIR"
+        "/L"
+        "/FFT"
+        "/NP"
+        "/FP"
+        "/XJ"
+        "/R:0"
+        "/W:0"
+    )
+
+    if ($excludeDirs.Count -gt 0) {
+        $rcArgs += "/XD"
+        foreach ($e in $excludeDirs) { $rcArgs += $e }
+    }
+    if ($excludeFiles.Count -gt 0) {
+        $rcArgs += "/XF"
+        foreach ($e in $excludeFiles) { $rcArgs += $e }
+    }
+
+    # Stream to screen and collect at once, so a long scan still shows
+    # progress instead of sitting silent until robocopy finishes.
+    $out = New-Object System.Collections.ArrayList
+    & robocopy @rcArgs | ForEach-Object {
+        Write-Host $_
+        [void]$out.Add([string]$_)
+    }
+    $rc = $LASTEXITCODE
+
+    if ($rc -ge 8) {
+        Write-Host ""
+        Write-Host "ERROR: robocopy failed with exit code $rc"
+        exit $rc
+    }
+
+    # ----------------------------------------------------------------
+    # Parse the body for names
+    # ----------------------------------------------------------------
+
+    $serverOnly    = @()
+    $localOnly     = @()
+    $serverNewer   = @()
+    $localNewer    = @()
+    $different     = @()
+    $serverOnlyDir = @()
+
+    foreach ($line in $out) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+        # Directory scan lines are "<spaces><count><spaces><path>" and
+        # carry no keyword. *EXTRA Dir lines do carry one, so test for
+        # the keyword before discarding plain scan lines.
+        $head = $line.Substring(0, [Math]::Min(24, $line.Length))
+
+        $isExtraDir = $head -match '(?i)\*EXTRA\s+Dir'
+
+        if (-not $isExtraDir -and $line -match '^\s+\d+\s+\S') { continue }
+        if ($line -notmatch '[A-Za-z]:\\') { continue }
+
+        if ($line -match '([A-Za-z]:\\.*)$') {
+            $fullPath = $matches[1].Trim()
+        }
+        else { continue }
+
+        # Make relative for display
+        $rel = $fullPath
+        if ($rel.StartsWith($local, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $rel = $rel.Substring($local.Length).TrimStart('\')
+        }
+        elseif ($rel.StartsWith($server, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $rel = $rel.Substring($server.Length).TrimStart('\')
+        }
+        if ($rel -eq "" -or $rel -eq $fullPath) { continue }
+
+        if ($isExtraDir) {
+            $serverOnlyDir += $rel
+            continue
+        }
+
+        # Anything else ending in a backslash is a directory header
+        if ($fullPath.EndsWith('\')) { continue }
+
+        $h = $head.ToLower()
+
+        if     ($h -match '\*extra')      { $serverOnly  += $rel }
+        elseif ($h -match 'new file')     { $localOnly   += $rel }
+        elseif ($h -match '\*lonely')     { $localOnly   += $rel }
+        elseif ($h -match '\bnewer\b')    { $localNewer  += $rel }
+        elseif ($h -match '\bolder\b')    { $serverNewer += $rel }
+        elseif ($h -match '\bchanged\b' -or
+                $h -match '\bsize\b'    -or
+                $h -match '\battrib\b')   { $different   += $rel }
+    }
+
+    # ----------------------------------------------------------------
+    # Parse robocopy's own totals as a cross-check
+    #
+    # These are authoritative in a way parsed body lines are not: if
+    # robocopy says files would be copied but we bucketed none, the
+    # parser is broken and must say so instead of printing "in sync".
+    # ----------------------------------------------------------------
+
+    $rcFilesCopied = -1
+    $rcFilesExtra  = -1
+    $rcDirsExtra   = -1
+
+    foreach ($line in $out) {
+        if ($line -match '^\s*Files\s*:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
+            $rcFilesCopied = [int]$matches[2]
+            $rcFilesExtra  = [int]$matches[6]
+        }
+        elseif ($line -match '^\s*Dirs\s*:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
+            $rcDirsExtra = [int]$matches[6]
+        }
+    }
+
+    $rcSaysDiff = ($rcFilesCopied -gt 0) -or ($rcFilesExtra -gt 0) -or ($rcDirsExtra -gt 0)
+
+    $allDiff = @($serverOnly) + @($localOnly) + @($serverNewer) +
+               @($localNewer) + @($different) + @($serverOnlyDir)
+
+    $divider = "-" * 78
+
+    Write-Host ""
+    Write-Host $divider
+    Write-Host "  REPORT"
+    Write-Host $divider
+    Write-Host ""
+
+    # Parser failed but robocopy disagrees - never claim "in sync" here.
+    if ($allDiff.Count -eq 0 -and ($rcSaysDiff -or $rc -ne 0)) {
+        Write-Host "  WARNING: robocopy reports differences but none could be read"
+        Write-Host "           from its output. The report below is incomplete."
+        Write-Host ""
+        if ($rcFilesCopied -gt 0) { Write-Host "  Files that would be copied: $rcFilesCopied" }
+        if ($rcFilesExtra  -gt 0) { Write-Host "  Extra files on server:      $rcFilesExtra" }
+        if ($rcDirsExtra   -gt 0) { Write-Host "  Extra dirs on server:       $rcDirsExtra" }
+        Write-Host ""
+        Write-Host "  DIFFERENCES FOUND - see robocopy output above"
+        Write-Host "  (robocopy exit code $rc)"
+        Write-Host ""
+        return
+    }
+
+    if ($allDiff.Count -eq 0) {
+        Write-Host "  IN SYNC - no differences found"
+        Write-Host ""
+        return
+    }
+
+    # --- File list ---
+    foreach ($f in ($serverOnlyDir | Sort-Object)) { Write-Host "  [SERVER DIR]    $f" }
+    foreach ($f in ($serverOnly    | Sort-Object)) { Write-Host "  [SERVER ONLY]   $f" }
+    foreach ($f in ($localOnly     | Sort-Object)) { Write-Host "  [LOCAL  ONLY]   $f" }
+    foreach ($f in ($serverNewer   | Sort-Object)) { Write-Host "  [SERVER NEWER]  $f" }
+    foreach ($f in ($localNewer    | Sort-Object)) { Write-Host "  [LOCAL  NEWER]  $f" }
+    foreach ($f in ($different     | Sort-Object)) { Write-Host "  [DIFFERENT]     $f" }
+
+    # --- Counts ---
+    Write-Host ""
+    Write-Host $divider
+
+    $total = $allDiff.Count
+    Write-Host "  $total item(s) differ"
+    Write-Host ""
+
+    if ($serverOnlyDir.Count -gt 0) { Write-Host ("  Server dirs:  " + $serverOnlyDir.Count) }
+    if ($serverOnly.Count    -gt 0) { Write-Host ("  Server only:  " + $serverOnly.Count) }
+    if ($localOnly.Count     -gt 0) { Write-Host ("  Local  only:  " + $localOnly.Count) }
+    if ($serverNewer.Count   -gt 0) { Write-Host ("  Server newer: " + $serverNewer.Count) }
+    if ($localNewer.Count    -gt 0) { Write-Host ("  Local  newer: " + $localNewer.Count) }
+    if ($different.Count     -gt 0) { Write-Host ("  Different:    " + $different.Count) }
+
+    # --- Verdict ---
+    $localAhead  = ($localNewer.Count  + $localOnly.Count)
+    $serverAhead = ($serverNewer.Count + $serverOnly.Count + $serverOnlyDir.Count)
+
+    Write-Host ""
+    Write-Host $divider
+
+    if ($localAhead -gt 0 -and $serverAhead -gt 0) {
+        Write-Host "  DIFFERENCES FOUND - both sides have changes"
+        Write-Host "  Run -pull to update local, -push to update server"
+    }
+    elseif ($localAhead -gt 0) {
+        Write-Host "  DIFFERENCES FOUND - local is newer"
+        Write-Host "  Run -push to update server"
+    }
+    elseif ($serverAhead -gt 0) {
+        Write-Host "  DIFFERENCES FOUND - server is newer"
+        Write-Host "  Run -pull to update local"
+    }
+    else {
+        Write-Host "  DIFFERENCES FOUND - timestamps match but content differs"
+        Write-Host "  Check manually before pushing or pulling"
+    }
+
+    Write-Host ""
+}
+
+function RunRobocopy($src, $dst, $excludeDirs, $excludeFiles) {
     $src = NormalizePath $src
     $dst = NormalizePath $dst
 
@@ -476,7 +729,7 @@ function RunRobocopy($src, $dst, $verifyOnly, $excludeDirs, $excludeFiles) {
         "/NP"
     )
 
-    if ($verifyOnly -or $dry) {
+    if ($dry) {
         $rcArgs += "/L"
     }
 
@@ -523,8 +776,10 @@ switch ($args[0]) {
     "--helpv" { HelpVerbose; exit }
     "helpv"   { HelpVerbose; exit }
 
-    "-path"      { $mode = "path" }
-    "-pathlinks" { $mode = "path"; $forceScan = $true }
+    "-path"       { $mode = "path" }
+    "--path"      { $mode = "path" }
+    "-pathlinks"  { $mode = "path"; $forceScan = $true }
+    "--pathlinks" { $mode = "path"; $forceScan = $true }
 }
 
 if ($mode -eq "path") {
@@ -605,13 +860,19 @@ switch ($args[0]) {
     "-scanLinks"  { $mode = "scanlinks" }
     "scanLinks"   { $mode = "scanlinks" }
 
+    "--compare"   { $mode = "compare" }
+    "-compare"    { $mode = "compare" }
+    "compare"     { $mode = "compare" }
+
     "-push"   { $mode = "push" }
+    "--push"  { $mode = "push" }
     "-store"  { $mode = "push" }
+    "--store" { $mode = "push" }
 
     "-pull"   { $mode = "pull" }
+    "--pull"  { $mode = "pull" }
     "-fetch"  { $mode = "pull" }
-
-    "-verify" { $mode = "verify" }
+    "--fetch" { $mode = "pull" }
 
     default {
         HelpShort
@@ -629,6 +890,12 @@ if ($mode -eq "scanlinks") {
     exit 0
 }
 
+if ($mode -eq "compare") {
+    SafetyCheck $local $server $false
+    DoCompare $local $server $excludeDirs $excludeFiles
+    exit 0
+}
+
 if ($mode -eq "push") {
     SafetyCheck $local $server $true
 
@@ -640,7 +907,7 @@ if ($mode -eq "push") {
 
     Write-Host ""
 
-    RunRobocopy $local $server $false $excludeDirs $excludeFiles
+    RunRobocopy $local $server $excludeDirs $excludeFiles
 }
 
 if ($mode -eq "pull") {
@@ -654,18 +921,5 @@ if ($mode -eq "pull") {
 
     Write-Host ""
 
-    RunRobocopy $server $local $false $excludeDirs $excludeFiles
-}
-
-if ($mode -eq "verify") {
-    SafetyCheck $local $server $false
-
-    Write-Host ""
-    Write-Host "VERIFYING"
-
-    ShowExcludes $confData.ConfDirs $excludeFiles $confData.LinkDirs
-
-    Write-Host ""
-
-    RunRobocopy $local $server $true $excludeDirs $excludeFiles
+    RunRobocopy $server $local $excludeDirs $excludeFiles
 }
