@@ -1,0 +1,21 @@
+XDRIVE DEPENDENCIES
+===================
+
+Required:
+- rclone
+- WinFsp
+
+Install with your Chocolatey shim "cc":
+
+cc install rclone -y
+cc install winfsp -y
+
+Verify:
+
+rclone version
+
+Notes:
+- WinFsp is required for rclone mount on Windows.
+- xdrive.bat and xdrive.ps1 should be kept in the same folder.
+- Your rclone remotes must already be configured with:
+  rclone config

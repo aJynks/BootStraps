@@ -40,6 +40,11 @@ CONFIG
 exclude lists for directories and files, and the symbolic links
 recorded by --scanLinks.
 
+The first line holds the server path:
+    serverPath = D:\Backup
+Older confs using "path=D:\Backup", or just a bare path on the first
+line, are still read.
+
 COMMANDS
 --------
 
@@ -54,6 +59,12 @@ COMMANDS
     depth. No paths - if the same name exists in many directories,
     it is excluded in all of them.
 
+    A full path is saved as its last name only, so typing the local
+    or the server path excludes BOTH copies:
+        d:\Projects\Site\uploaded.site  ->  uploaded.site
+    Existing confs are used exactly as written; entries are only
+    shortened when -path creates the config.
+
     Names do not need to exist yet; nothing is validated.
 
     Add -scanLinks to scan for symbolic links straight after the
@@ -64,6 +75,7 @@ COMMANDS
         backup -path "D:\Backup" --excludeDir node_modules .git
         backup -path "D:\Backup" --excludeDir "my folder" --excludeFile *.log thumbs.db
         backup -path "D:\Backup" --excludeDir node_modules -scanLinks
+        backup -path "D:\Backup" --excludeDir "d:\Projects\Site\uploaded.site"
 
 -pathlinks "PATH" [--excludeDir ...] [--excludeFile ...]
     Same as -path with -scanLinks always applied.
@@ -163,6 +175,35 @@ function NormalizePath($p) {
     return $clean
 }
 
+function GetExcludeName($entry) {
+    # Used only when -path creates the conf: an exclude given as a
+    # path is reduced to its last name, so
+    #   d:\Projects\Site\uploaded.site  ->  uploaded.site
+    #   y:\Server\Site\uploaded.site    ->  uploaded.site
+    # Robocopy matches a plain name on both sides at any depth, so the
+    # local and server copies are both excluded.
+    # Plain names come back unchanged. Returns "" for a drive root
+    # (d:\) which has no name to keep.
+    $n = NormalizePath $entry
+
+    if ($n -notmatch '[\\:]') {
+        return $n
+    }
+
+    $leaf = $n
+    $idx = $n.LastIndexOf('\')
+    if ($idx -ge 0) {
+        $leaf = $n.Substring($idx + 1)
+    }
+
+    # "d:" or drive-relative "d:name"
+    if ($leaf -match '^[A-Za-z]:(.*)$') {
+        $leaf = $matches[1]
+    }
+
+    return $leaf.Trim()
+}
+
 # --------------------------------------------------------------------
 # Raw command-line tokenizer.
 #
@@ -232,8 +273,10 @@ function SaveConf($serverPath, $excludeDirs, $excludeFiles, $linkDirs = @(), [bo
         $linkDirs = @($linkDirs | Sort-Object)
     }
 
-    # Blank line before each header for readability
-    $lines = @("path=$clean")
+    # Blank line before each header for readability.
+    # "serverPath = " is the current key; ReadConf still accepts the
+    # older "path=" and bare-path forms.
+    $lines = @("serverPath = $clean")
 
     if ($excludeDirs.Count -gt 0) {
         $lines += ""
@@ -302,8 +345,10 @@ function ReadConf {
     foreach ($line in $lines) {
         $trimmed = ([string]$line).Trim()
 
-        if ($trimmed -match '^path=(.*)$') {
-            $serverPath = NormalizePath $matches[1]
+        if ($trimmed -match '^(serverPath|path)\s*=\s*(.*)$') {
+            # Current key "serverPath = ..." or legacy "path=...".
+            # Any letter case, any spacing around the "=".
+            $serverPath = NormalizePath $matches[2]
         }
         elseif ($trimmed -match '^--==\s*(.*?)\s*==--$') {
             # Any header line switches section. Unknown headers stop
@@ -800,6 +845,7 @@ if ($mode -eq "path") {
     $targetPath = $tokens[1]
     $excludeDirs = @()
     $excludeFiles = @()
+    $shortened = @()
     $collecting = "none"
     $scanAfter = $forceScan
 
@@ -828,14 +874,39 @@ if ($mode -eq "path") {
             $entry = $entry -replace '^\.[\\/]', ''
             $entry = $entry.TrimEnd('\', '/')
             if ($entry -ne "") {
+                # A path is stored as its last name only, so it
+                # excludes both the local and the server copy.
+                $name = GetExcludeName $entry
+                if ($name -eq "") {
+                    Write-Host "ERROR: '$t' is a drive root, not a name to exclude"
+                    Write-Host "Nothing was saved."
+                    exit 1
+                }
+                if ($name -ne $entry) {
+                    $shortened += "  $entry  ->  $name"
+                }
+
+                # Skip names already collected (case-insensitive)
                 if ($collecting -eq "dirs") {
-                    $excludeDirs += $entry
+                    if (-not ($excludeDirs | Where-Object { $_ -ieq $name })) {
+                        $excludeDirs += $name
+                    }
                 }
                 else {
-                    $excludeFiles += $entry
+                    if (-not ($excludeFiles | Where-Object { $_ -ieq $name })) {
+                        $excludeFiles += $name
+                    }
                 }
             }
         }
+    }
+
+    if ($shortened.Count -gt 0) {
+        Write-Host "Paths shortened to names (excludes local and server copies):"
+        foreach ($s in $shortened) {
+            Write-Host $s
+        }
+        Write-Host ""
     }
 
     # Nothing is validated: names may refer to directories or
@@ -922,4 +993,4 @@ if ($mode -eq "pull") {
     Write-Host ""
 
     RunRobocopy $server $local $excludeDirs $excludeFiles
-}
+}

@@ -1,38 +1,14 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal
+REM yt-video.bat - single YouTube video downloader
+REM Backend: yt-downloader_script.py (must sit next to this .bat)
 
-REM yt-video-tolerant.bat - wrapper for yt-dlp
-REM Accepts either:
-REM   yt-video URL
-REM   yt-video URL --extra <yt-dlp args...>
-REM Also tolerates extra args without --extra (treats them as yt-dlp args), to avoid false errors.
-
-if "%~1"=="" goto :usage
-if /I "%~1"=="help" goto :usage
-
-set "URL=%~1"
-shift
-
-set "PASS_ARGS="
-
-REM Preferred form: --extra <args...>
-if /I "%~1"=="--extra" (
-    shift
-    set "PASS_ARGS=%*"
-) else (
-    REM Tolerate any remaining args as yt-dlp args (some shells/wrappers accidentally append things)
-    set "PASS_ARGS=%*"
+where python >nul 2>&1
+if errorlevel 1 (
+    echo Error: python not found on PATH.
+    echo Install: winget install Python.Python.3.12
+    endlocal & exit /b 9009
 )
 
-REM Run yt-dlp (quote URL; leave PASS_ARGS unquoted so yt-dlp sees normal tokens)
-yt-dlp "%URL%" %PASS_ARGS%
-
-endlocal
-exit /b %ERRORLEVEL%
-
-:usage
-echo Usage:
-echo   yt-video URL
-echo   yt-video URL --extra ^<yt-dlp args...^>
-endlocal
-exit /b 1
+python "%~dp0yt-downloader_script.py" video %*
+endlocal & exit /b %ERRORLEVEL%
