@@ -113,6 +113,10 @@ COMMANDS
         [LOCAL  NEWER]  local copy has a more recent timestamp
         [DIFFERENT]     size or attributes differ, timestamps equal
 
+    Excluded files and directories that also exist on the server are
+    listed separately as [EXCLUDED]. They are never copied or deleted,
+    so they do not count as differences.
+
     A count summary follows, then a single verdict line saying
     whether anything differs and which side is newer:
 
@@ -529,6 +533,115 @@ function DoScanLinks($serverPath, $excludeDirs, $excludeFiles) {
     }
 }
 
+function FindExcludedFiles($root, $excludeDirs, $excludeFiles) {
+    # Walks $root for files matching the excluded file names/wildcards,
+    # following robocopy's rules: never enters excluded directories or
+    # directory links/junctions (/XJ). Used only by --compare.
+    $found = @()
+    $complete = $true
+
+    $dirNames  = @($excludeDirs  | Where-Object { $_ -notmatch '[\\:]' })
+    $dirFull   = @($excludeDirs  | Where-Object { $_ -match '[\\:]' } | ForEach-Object { NormalizePath $_ })
+    $fileNames = @($excludeFiles | Where-Object { $_ -notmatch '[\\:]' })
+    $fileFull  = @($excludeFiles | Where-Object { $_ -match '[\\:]' } | ForEach-Object { NormalizePath $_ })
+
+    $rootNorm = NormalizePath $root
+    $stack = New-Object System.Collections.Stack
+    $stack.Push((New-Object System.IO.DirectoryInfo $rootNorm))
+
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        try {
+            $files = $dir.GetFiles()
+            $subs  = $dir.GetDirectories()
+        }
+        catch {
+            $complete = $false
+            continue
+        }
+
+        foreach ($f in $files) {
+            $hit = $false
+            foreach ($p in $fileNames) { if ($f.Name -like $p) { $hit = $true; break } }
+            if (-not $hit) {
+                foreach ($p in $fileFull) { if ($f.FullName -ieq $p) { $hit = $true; break } }
+            }
+            if ($hit) {
+                $found += [pscustomobject]@{
+                    Rel  = $f.FullName.Substring($rootNorm.Length).TrimStart('\')
+                    Size = [long]$f.Length
+                }
+            }
+        }
+
+        foreach ($d in $subs) {
+            if ($d.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            $skip = $false
+            foreach ($p in $dirNames) { if ($d.Name -like $p) { $skip = $true; break } }
+            if (-not $skip) {
+                foreach ($p in $dirFull) { if ($d.FullName -ieq $p) { $skip = $true; break } }
+            }
+            if (-not $skip) { $stack.Push($d) }
+        }
+    }
+
+    return @{ Files = $found; Complete = $complete }
+}
+
+function TestBytesMatch([long]$bytes, $shown) {
+    # Compares an exact byte count with robocopy's printed figure,
+    # which is rounded to two decimals once a k/m/g/t unit is used.
+    if ($null -eq $shown) { return $false }
+    if ($shown.Unit -eq "") { return ([double]$bytes -eq $shown.Value) }
+
+    # Tolerance covers rounding or truncation to two decimals; both
+    # 1024- and 1000-based units are accepted.
+    $pow = @{ k = 1; m = 2; g = 3; t = 4 }[$shown.Unit]
+    foreach ($base in 1024, 1000) {
+        $scaled = $bytes / [math]::Pow($base, $pow)
+        if ([math]::Abs($scaled - $shown.Value) -le 0.0101) { return $true }
+    }
+    return $false
+}
+
+function TestExcluded($rel, $fullPath, [bool]$isDir, $excludeDirs, $excludeFiles) {
+    # Mirrors how robocopy applies /XD and /XF, for --compare only:
+    #   - excluded file names / wildcards match the file's own name
+    #   - excluded dir names / wildcards match any folder in its path
+    #   - full-path entries (old confs, system links) match only that
+    #     exact path or anything inside it
+    # Errs towards "not excluded", so a real difference is never hidden.
+    $segments = @($rel.TrimEnd('\') -split '\\' | Where-Object { $_ -ne "" })
+    if ($segments.Count -eq 0) { return $false }
+
+    $leaf = $segments[$segments.Count - 1]
+    $dirSegments = if ($isDir) { $segments } else { @($segments | Select-Object -First ($segments.Count - 1)) }
+
+    if (-not $isDir) {
+        foreach ($p in $excludeFiles) {
+            if ($p -match '[\\:]') { continue }
+            if ($leaf -like $p) { return $true }
+        }
+    }
+
+    $full = (NormalizePath $fullPath)
+    foreach ($p in $excludeDirs) {
+        if ($p -match '[\\:]') {
+            $fp = NormalizePath $p
+            if ($full -ieq $fp -or $full.StartsWith($fp + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+        else {
+            foreach ($s in $dirSegments) {
+                if ($s -like $p) { return $true }
+            }
+        }
+    }
+
+    return $false
+}
+
 function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
     # Robocopy runs in list-only mode (/L), so nothing is ever modified.
     #
@@ -603,6 +716,8 @@ function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
     $localNewer    = @()
     $different     = @()
     $serverOnlyDir = @()
+    $excludedFiles = @()   # extras on server that the excludes protect
+    $excludedDirs  = @()
 
     foreach ($line in $out) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -633,7 +748,12 @@ function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
         if ($rel -eq "" -or $rel -eq $fullPath) { continue }
 
         if ($isExtraDir) {
-            $serverOnlyDir += $rel
+            if (TestExcluded $rel $fullPath $true $excludeDirs $excludeFiles) {
+                $excludedDirs += $rel
+            }
+            else {
+                $serverOnlyDir += $rel
+            }
             continue
         }
 
@@ -642,7 +762,16 @@ function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
 
         $h = $head.ToLower()
 
-        if     ($h -match '\*extra')      { $serverOnly  += $rel }
+        if     ($h -match '\*extra') {
+            # /X also lists excluded extras; they are protected from
+            # the /MIR delete, so they are not differences.
+            if (TestExcluded $rel $fullPath $false $excludeDirs $excludeFiles) {
+                $excludedFiles += $rel
+            }
+            else {
+                $serverOnly += $rel
+            }
+        }
         elseif ($h -match 'new file')     { $localOnly   += $rel }
         elseif ($h -match '\*lonely')     { $localOnly   += $rel }
         elseif ($h -match '\bnewer\b')    { $localNewer  += $rel }
@@ -663,6 +792,7 @@ function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
     $rcFilesCopied = -1
     $rcFilesExtra  = -1
     $rcDirsExtra   = -1
+    $rcBytesExtra  = $null   # @{ Value; Unit } as robocopy prints it
 
     foreach ($line in $out) {
         if ($line -match '^\s*Files\s*:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
@@ -672,9 +802,81 @@ function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
         elseif ($line -match '^\s*Dirs\s*:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)') {
             $rcDirsExtra = [int]$matches[6]
         }
+        elseif ($line -match '^\s*Bytes\s*:(.*)$') {
+            # Six values, each a number with an optional k/m/g/t unit,
+            # e.g. "17.36 m   0   17.36 m   0   0   117"
+            $vals = [regex]::Matches($matches[1], '(\d+(?:\.\d+)?)(?:\s+([kmgt])\b)?')
+            if ($vals.Count -ge 6) {
+                $v = $vals[5]
+                $rcBytesExtra = @{
+                    Value = [double]::Parse($v.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+                    Unit  = $v.Groups[2].Value.ToLower()
+                }
+            }
+        }
     }
 
-    $rcSaysDiff = ($rcFilesCopied -gt 0) -or ($rcFilesExtra -gt 0) -or ($rcDirsExtra -gt 0)
+    # ----------------------------------------------------------------
+    # Account for excluded files on the server
+    #
+    # Robocopy counts excluded files that exist on the server in its
+    # Extras totals, but never names them (even with /X). They are
+    # protected from the /MIR delete, so they are not differences.
+    # When robocopy reports extras it did not name, the server is
+    # walked for files matching the exclude lists. Only if the count
+    # AND the byte total both match robocopy's figures are those
+    # extras treated as explained.
+    # ----------------------------------------------------------------
+
+    $effFilesExtra = $rcFilesExtra - $serverOnly.Count - $excludedFiles.Count
+    $effDirsExtra  = $rcDirsExtra  - $serverOnlyDir.Count - $excludedDirs.Count
+    $scanFound     = @()
+    $scanNote      = ""
+
+    if ($rcFilesExtra -gt 0 -and $effFilesExtra -gt 0 -and $excludeFiles.Count -gt 0) {
+        $scan = FindExcludedFiles $server $excludeDirs $excludeFiles
+        $scanFound = @($scan.Files)
+
+        # Bytes of the extras robocopy DID name, read from the server
+        $namedBytes = [long]0
+        $namedOk = $true
+        foreach ($r in (@($serverOnly) + @($excludedFiles))) {
+            try   { $namedBytes += (Get-Item -LiteralPath (Join-Path $server $r) -Force).Length }
+            catch { $namedOk = $false }
+        }
+
+        $scanBytes = [long]0
+        foreach ($f in $scanFound) { $scanBytes += $f.Size }
+
+        $countOk = ($scanFound.Count -eq $effFilesExtra)
+        $bytesOk = $namedOk -and (TestBytesMatch ($namedBytes + $scanBytes) $rcBytesExtra)
+
+        if ($scan.Complete -and $countOk -and $bytesOk) {
+            foreach ($f in $scanFound) { $excludedFiles += $f.Rel }
+            $effFilesExtra = 0
+        }
+        elseif ($scanFound.Count -gt 0) {
+            if (-not $scan.Complete) {
+                $scanNote = "(part of the server could not be read)"
+            }
+            elseif (-not $countOk) {
+                $scanNote = "(found $($scanFound.Count) excluded file(s), robocopy reports $effFilesExtra unnamed extra(s))"
+            }
+            else {
+                $scanNote = "(file count matches but sizes do not)"
+            }
+        }
+    }
+
+    if ($rcFilesCopied -lt 0) {
+        # Totals could not be read - fall back to the exit code
+        $rcSaysDiff = ($rc -ne 0)
+    }
+    else {
+        # Exit code bit 4 = mismatched items, not shown in the columns used
+        $rcSaysDiff = ($rcFilesCopied -gt 0) -or ($effFilesExtra -gt 0) -or
+                      ($effDirsExtra -gt 0) -or (($rc -band 4) -ne 0)
+    }
 
     $allDiff = @($serverOnly) + @($localOnly) + @($serverNewer) +
                @($localNewer) + @($different) + @($serverOnlyDir)
@@ -687,15 +889,37 @@ function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
     Write-Host $divider
     Write-Host ""
 
+    # Excluded files found by the server walk that could NOT be matched
+    # to robocopy's totals - shown so the user can see what was checked
+    $showScanUnmatched = {
+        if ($effFilesExtra -gt 0 -and $scanFound.Count -gt 0) {
+            Write-Host "  Excluded files found on server $scanNote"
+            foreach ($f in ($scanFound | Sort-Object Rel)) { Write-Host "    [EXCLUDED?]   $($f.Rel)" }
+            Write-Host ""
+        }
+    }
+
+    # Excluded extras: listed for information, never counted
+    $showExcluded = {
+        if (($excludedDirs.Count + $excludedFiles.Count) -gt 0) {
+            Write-Host "  Excluded on server (never copied or deleted):"
+            foreach ($f in ($excludedDirs  | Sort-Object)) { Write-Host "    [EXCLUDED]    $f\" }
+            foreach ($f in ($excludedFiles | Sort-Object)) { Write-Host "    [EXCLUDED]    $f" }
+            Write-Host ""
+        }
+    }
+
     # Parser failed but robocopy disagrees - never claim "in sync" here.
-    if ($allDiff.Count -eq 0 -and ($rcSaysDiff -or $rc -ne 0)) {
+    if ($allDiff.Count -eq 0 -and $rcSaysDiff) {
         Write-Host "  WARNING: robocopy reports differences but none could be read"
         Write-Host "           from its output. The report below is incomplete."
         Write-Host ""
         if ($rcFilesCopied -gt 0) { Write-Host "  Files that would be copied: $rcFilesCopied" }
-        if ($rcFilesExtra  -gt 0) { Write-Host "  Extra files on server:      $rcFilesExtra" }
-        if ($rcDirsExtra   -gt 0) { Write-Host "  Extra dirs on server:       $rcDirsExtra" }
+        if ($effFilesExtra -gt 0) { Write-Host "  Extra files on server that could not be identified: $effFilesExtra" }
+        if ($effDirsExtra  -gt 0) { Write-Host "  Extra dirs on server that could not be identified:  $effDirsExtra" }
         Write-Host ""
+        & $showExcluded
+        & $showScanUnmatched
         Write-Host "  DIFFERENCES FOUND - see robocopy output above"
         Write-Host "  (robocopy exit code $rc)"
         Write-Host ""
@@ -705,6 +929,7 @@ function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
     if ($allDiff.Count -eq 0) {
         Write-Host "  IN SYNC - no differences found"
         Write-Host ""
+        & $showExcluded
         return
     }
 
@@ -756,6 +981,8 @@ function DoCompare($local, $server, $excludeDirs, $excludeFiles) {
     }
 
     Write-Host ""
+    & $showExcluded
+    & $showScanUnmatched
 }
 
 function RunRobocopy($src, $dst, $excludeDirs, $excludeFiles) {
